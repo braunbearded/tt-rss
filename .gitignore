@@ -7,7 +7,6 @@ Thumbs.db
 #*
 .idea/*
 plugins.local/*
-themes.local/*
 config.php
 feed-icons/*
 cache/*/*
