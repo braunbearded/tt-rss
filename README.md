@@ -1,7 +1,19 @@
+Fork
+=============
+This is just a fork from <https://git.tt-rss.org/fox/tt-rss>.
+So all props to the guys from <http://tt-rss.org>.
+
+I forked it because deploying ttrss to heroku as a submodule throw some
+certificate errors. In case you want to host your own ttrss instance on
+heroku check out <https://github.com/serl/ttrss-heroku>. After cloning just
+point the url in .gitmodules to this repo.
+
+Includes feedly theme from <https://github.com/levito/tt-rss-feedly-theme>.
+
 Tiny Tiny RSS
 =============
 
-Web-based news feed aggregator, designed to allow you to read news from 
+Web-based news feed aggregator, designed to allow you to read news from
 any location, while feeling as close to a real desktop application as possible.
 
 http://tt-rss.org
