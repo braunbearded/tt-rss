@@ -3,7 +3,12 @@ class RSSUtils {
 	static function calculate_article_hash($article, $pluginhost) {
 		$tmp = "";
 
+		$ignored_fields = [ "feed", "guid", "guid_hashed", "owner_uid", "force_catchup" ];
+
 		foreach ($article as $k => $v) {
+			if (in_array($k, $ignored_fields))
+				continue;
+
 			if ($k != "feed" && isset($v)) {
 				$x = strip_tags(is_array($v) ? implode(",", $v) : $v);
 
@@ -469,7 +474,7 @@ class RSSUtils {
 			foreach ($pluginhost->get_hooks(PluginHost::HOOK_FEED_PARSED) as $plugin) {
 				Debug::log("... " . get_class($plugin), Debug::$LOG_VERBOSE);
 				$start = microtime(true);
-				$plugin->hook_feed_parsed($rss);
+				$plugin->hook_feed_parsed($rss, $feed);
 				Debug::log(sprintf("=== %.4f (sec)", microtime(true) - $start), Debug::$LOG_VERBOSE);
 			}
 
@@ -586,11 +591,11 @@ class RSSUtils {
 					continue;
 				}
 
+				$entry_guid_hashed_compat = 'SHA1:' . sha1("$owner_uid,$entry_guid");
+				$entry_guid_hashed = json_encode(["ver" => 2, "uid" => $owner_uid, "hash" => 'SHA1:' . sha1($entry_guid)]);
 				$entry_guid = "$owner_uid,$entry_guid";
 
-				$entry_guid_hashed = 'SHA1:' . sha1($entry_guid);
-
-				Debug::log("guid $entry_guid / $entry_guid_hashed", Debug::$LOG_VERBOSE);
+				Debug::log("guid $entry_guid (hash: $entry_guid_hashed compat: $entry_guid_hashed_compat)", Debug::$LOG_VERBOSE);
 
 				$entry_timestamp = (int)$item->get_date();
 
@@ -632,8 +637,8 @@ class RSSUtils {
 				Debug::log("done collecting data.", Debug::$LOG_VERBOSE);
 
 				$sth = $pdo->prepare("SELECT id, content_hash, lang FROM ttrss_entries
-					WHERE guid = ? OR guid = ?");
-				$sth->execute([$entry_guid, $entry_guid_hashed]);
+					WHERE guid IN (?, ?, ?)");
+				$sth->execute([$entry_guid, $entry_guid_hashed, $entry_guid_hashed_compat]);
 
 				if ($row = $sth->fetch()) {
 					$base_entry_id = $row["id"];
@@ -828,8 +833,8 @@ class RSSUtils {
 					RSSUtils::cache_media($entry_content, $site_url);
 
 				$csth = $pdo->prepare("SELECT id FROM ttrss_entries
-					WHERE guid = ? OR guid = ?");
-				$csth->execute([$entry_guid, $entry_guid_hashed]);
+					WHERE guid IN (?, ?, ?)");
+				$csth->execute([$entry_guid, $entry_guid_hashed, $entry_guid_hashed_compat]);
 
 				if (!$row = $csth->fetch()) {
 
@@ -874,7 +879,7 @@ class RSSUtils {
 
 				}
 
-				$csth->execute([$entry_guid, $entry_guid_hashed]);
+				$csth->execute([$entry_guid, $entry_guid_hashed, $entry_guid_hashed_compat]);
 
 				$entry_ref_id = 0;
 				$entry_int_id = 0;
@@ -1032,6 +1037,11 @@ class RSSUtils {
 
 				if (is_array($encs)) {
 					foreach ($encs as $e) {
+
+						foreach ($pluginhost->get_hooks(PluginHost::HOOK_ENCLOSURE_IMPORTED) as $plugin) {
+							$e = $plugin->hook_enclosure_imported($e, $feed);
+						}
+
 						$e_item = array(
 							rewrite_relative_url($site_url, $e->link),
 							$e->type, $e->length, $e->title, $e->width, $e->height);
@@ -1186,6 +1196,7 @@ class RSSUtils {
 		return true;
 	}
 
+	/* TODO: move to DiskCache? */
 	static function cache_enclosures($enclosures, $site_url) {
 		$cache = new DiskCache("images");
 
@@ -1221,6 +1232,34 @@ class RSSUtils {
 		}
 	}
 
+	/* TODO: move to DiskCache? */
+	static function cache_media_url($cache, $url, $site_url) {
+		$url = rewrite_relative_url($site_url, $url);
+		$local_filename = sha1($url);
+
+		Debug::log("cache_media: checking $url", Debug::$LOG_VERBOSE);
+
+		if (!$cache->exists($local_filename)) {
+			Debug::log("cache_media: downloading: $url to $local_filename", Debug::$LOG_VERBOSE);
+
+			global $fetch_last_error_code;
+			global $fetch_last_error;
+
+			$file_content = fetch_file_contents(array("url" => $url,
+				"http_referrer" => $url,
+				"max_size" => MAX_CACHE_FILE_SIZE));
+
+			if ($file_content) {
+				$cache->put($local_filename, $file_content);
+			} else {
+				Debug::log("cache_media: failed with $fetch_last_error_code: $fetch_last_error");
+			}
+		} else if ($cache->isWritable($local_filename)) {
+			$cache->touch($local_filename);
+		}
+	}
+
+	/* TODO: move to DiskCache? */
 	static function cache_media($html, $site_url) {
 		$cache = new DiskCache("images");
 
@@ -1229,35 +1268,20 @@ class RSSUtils {
 			if ($doc->loadHTML($html)) {
 				$xpath = new DOMXPath($doc);
 
-				$entries = $xpath->query('(//img[@src])|(//video/source[@src])|(//audio/source[@src])|(//video[@poster])|(//video[@src])');
+				$entries = $xpath->query('(//img[@src]|//source[@src|@srcset]|//video[@poster|@src])');
 
 				foreach ($entries as $entry) {
 					foreach (array('src', 'poster') as $attr) {
 						if ($entry->hasAttribute($attr) && strpos($entry->getAttribute($attr), "data:") !== 0) {
-							$src = rewrite_relative_url($site_url, $entry->getAttribute($attr));
+							RSSUtils::cache_media_url($cache, $entry->getAttribute($attr), $site_url);
+						}
+					}
 
-							$local_filename = sha1($src);
+					if ($entry->hasAttribute("srcset")) {
+						$matches = RSSUtils::decode_srcset($entry->getAttribute('srcset'));
 
-							Debug::log("cache_media: checking $src", Debug::$LOG_VERBOSE);
-
-							if (!$cache->exists($local_filename)) {
-								Debug::log("cache_media: downloading: $src to $local_filename", Debug::$LOG_VERBOSE);
-
-								global $fetch_last_error_code;
-								global $fetch_last_error;
-
-								$file_content = fetch_file_contents(array("url" => $src,
-									"http_referrer" => $src,
-									"max_size" => MAX_CACHE_FILE_SIZE));
-
-								if ($file_content) {
-									$cache->put($local_filename, $file_content);
-								} else {
-									Debug::log("cache_media: failed with $fetch_last_error_code: $fetch_last_error");
-								}
-							} else if ($cache->isWritable($local_filename)) {
-								$cache->touch($local_filename);
-							}
+						for ($i = 0; $i < count($matches); $i++) {
+							RSSUtils::cache_media_url($cache, $matches[$i]["url"], $site_url);
 						}
 					}
 				}
@@ -1713,4 +1737,32 @@ class RSSUtils {
 		return $favicon_url;
 	}
 
+	// https://community.tt-rss.org/t/problem-with-img-srcset/3519
+	static function decode_srcset($srcset) {
+		$matches = [];
+
+		preg_match_all(
+			'/(?:\A|,)\s*(?P<url>(?!,)\S+(?<!,))\s*(?P<size>\s\d+w|\s\d+(?:\.\d+)?(?:[eE][+-]?\d+)?x|)\s*(?=,|\Z)/',
+			$srcset, $matches, PREG_SET_ORDER
+		);
+
+		foreach ($matches as $m) {
+			array_push($matches, [
+				"url" => trim($m["url"]),
+				"size" => trim($m["size"])
+			]);
+		}
+
+		return $matches;
+	}
+
+	static function encode_srcset($matches) {
+		$tokens = [];
+
+		foreach ($matches as $m) {
+			array_push($tokens, trim($m["url"]) . " " . trim($m["size"]));
+		}
+
+		return implode(",", $tokens);
+	}
 }
